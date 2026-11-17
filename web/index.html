@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="{{.Lang}}">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>{{if .Relay.Name}}{{t "titleNamed" "name" .Relay.Name}}{{else}}{{t "title"}}{{end}}</title>
+    <link rel="stylesheet" href="app.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        {{if .Relay.Icon}}<img class="icon" src="{{.Relay.Icon}}" alt="" />{{end}}
+        <h1>{{if .Relay.Name}}{{.Relay.Name}}{{else}}{{t "nostrRelay"}}{{end}}</h1>
+        {{if .Relay.Description}}<p class="description">{{.Relay.Description}}</p>{{end}}
+        {{if .Relay.URL}}<p class="relay-url"><code>{{.Relay.URL}}</code></p>{{end}}
+      </header>
+
+      {{if not .Accepting}}
+      <section class="notice">{{t "open"}}</section>
+      {{else if not .Available}}
+      <section class="notice">{{t "notTakingRetry"}}</section>
+      {{else}}
+      <section id="offer">
+        <p class="price">
+          <strong>{{t "sats" "n" (num .PriceSats)}}</strong>
+          {{if .PeriodDays}}{{tn "forDays" .PeriodDays}}{{else}}{{t "forPermanent"}}{{end}}
+        </p>
+        <p>{{t "readingFree"}}</p>
+        <form id="key-form">
+          <label for="pubkey">{{t "yourKey"}}</label>
+          <div class="row">
+            <input
+              id="pubkey"
+              name="pubkey"
+              autocomplete="off"
+              autocapitalize="off"
+              spellcheck="false"
+              placeholder="{{t "keyPlaceholder"}}"
+              aria-describedby="status"
+              required
+            />
+            <button type="button" id="use-extension" hidden>
+              {{t "useExtension"}}
+            </button>
+          </div>
+        </form>
+        <p id="status" role="status"></p>
+        <button type="button" id="pay" class="primary" hidden></button>
+      </section>
+
+      <section id="invoice" hidden>
+        <p class="for-key">{{t "forKey"}} <code id="invoice-key"></code></p>
+        <p id="invoice-status" role="status"></p>
+        <div class="tabs" id="tabs" hidden>
+          <button type="button" data-tab="lightning">{{t "lightning"}}</button>
+          <button type="button" data-tab="onchain">{{t "onchain"}}</button>
+        </div>
+        <div id="lightning" class="pay-panel">
+          <a id="ln-qr-link"><img id="ln-qr" alt="{{t "lnInvoice"}}" /></a>
+          <a id="ln-link" class="button primary">{{t "openWallet"}}</a>
+          <textarea
+            id="ln-text"
+            readonly
+            rows="4"
+            aria-label="{{t "lnInvoice"}}"
+          ></textarea>
+          <button type="button" class="copy" data-copy="ln-text">
+            {{t "copyInvoice"}}
+          </button>
+        </div>
+        <div id="onchain" class="pay-panel" hidden>
+          <a id="chain-qr-link"><img id="chain-qr" alt="{{t "btcAddress"}}" /></a>
+          <a id="chain-link" class="button primary">{{t "openWallet"}}</a>
+          <input id="chain-text" readonly aria-label="{{t "btcAddress"}}" />
+          <button type="button" class="copy" data-copy="chain-text">
+            {{t "copyAddress"}}
+          </button>
+        </div>
+        <div id="next-step" class="next-step" hidden>
+          {{if .Relay.URL}}
+          <p>{{t "addRelay"}}</p>
+          <div class="row">
+            <input
+              id="relay-url"
+              readonly
+              value="{{.Relay.URL}}"
+              aria-label="{{t "relayAddress"}}"
+            />
+            <button type="button" class="copy" data-copy="relay-url">
+              {{t "copy"}}
+            </button>
+          </div>
+          {{else}}
+          <p>{{t "addRelayNoURL"}}</p>
+          {{end}}
+        </div>
+        <div class="actions">
+          <button type="button" id="renew" class="primary" hidden>
+            {{t "newInvoice"}}
+          </button>
+          <button type="button" id="back">{{t "back"}}</button>
+        </div>
+      </section>
+      {{end}}
+
+      <noscript>
+        <section class="notice">{{t "noscript"}}</section>
+      </noscript>
+
+      <footer>
+        {{if .Relay.Terms}}<a href="{{.Relay.Terms}}" rel="noopener noreferrer">{{t "terms"}}</a>{{end}}
+        {{if .Relay.Privacy}}<a href="{{.Relay.Privacy}}" rel="noopener noreferrer">{{t "privacy"}}</a>{{end}}
+        {{if .ContactHref}}<span>{{t "contact"}} <a href="{{.ContactHref}}">{{.ContactText}}</a></span>{{else if .Relay.Contact}}<span>{{t "contact"}} {{.Relay.Contact}}</span>{{end}}
+      </footer>
+      <nav class="languages" aria-label="{{t "language"}}">
+        {{range .Languages}}{{if .Current}}<span aria-current="true" lang="{{.Tag}}">{{.Name}}</span>{{else}}<a href="?lang={{.Code}}" hreflang="{{.Tag}}" lang="{{.Tag}}">{{.Name}}</a>{{end}}
+        {{end}}
+      </nav>
+    </main>
+    <script
+      src="app.js"
+      data-price="{{.PriceSats}}"
+      data-period-days="{{.PeriodDays}}"
+      data-strings="{{.Strings}}"
+    ></script>
+  </body>
+</html>
