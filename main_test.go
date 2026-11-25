@@ -1,8 +1,14 @@
 package main
 
 import (
+	"bufio"
+	"fmt"
+	"io"
 	"maps"
+	"net"
+	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"regexp"
 	"slices"
 	"strings"
@@ -174,5 +180,101 @@ func TestCredit(t *testing.T) {
 	}
 	if !slices.Equal(slices.Sorted(maps.Keys(s.Members)), []string{"a", "b", "c"}) {
 		t.Errorf("members %v", slices.Sorted(maps.Keys(s.Members)))
+	}
+}
+
+func TestRouting(t *testing.T) {
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "relay %s %s host=%s xff=%s", r.Method, r.URL.Path, r.Host, r.Header.Get("X-Forwarded-For"))
+	}))
+	defer relay.Close()
+	pages, err := parsePages()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &server{accepting: true, backend: lnbits{}, priceSats: 21000, periodDays: 30, pages: pages, st: &state{stateFile: stateFile{Members: map[string]member{}}}}
+	upstream, _ := url.Parse(relay.URL)
+	const html, nip11 = "text/html,application/xhtml+xml", "application/nostr+json"
+	for _, c := range []struct {
+		method, path, accept string
+		relay                bool
+		code                 int
+		want                 string
+	}{
+		{"GET", "/", html, true, http.StatusFound, "Location: /join/"},
+		{"GET", "/?lang=es", html, true, http.StatusFound, "Location: /join/?lang=es"},
+		{"GET", "/", nip11, true, http.StatusOK, "relay GET / host=relay.example xff=203.0.113.7"},
+		{"POST", "/", html, true, http.StatusOK, "relay POST /"},
+		{"GET", "/metrics", html, true, http.StatusOK, "relay GET /metrics"},
+		{"GET", "/join", html, true, http.StatusTemporaryRedirect, "Location: /join/"},
+		{"GET", "/join/", html, true, http.StatusOK, `<html lang="en-US">`},
+		{"GET", "/join/app.js", "*/*", true, http.StatusOK, "async function api"},
+		{"GET", "/join/api/member/7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e", "*/*", true, http.StatusOK, `"member":false`},
+		{"GET", "/", html, false, http.StatusFound, "Location: /join/"},
+		{"GET", "/", nip11, false, http.StatusNotFound, ""},
+		{"GET", "/metrics", html, false, http.StatusNotFound, ""},
+	} {
+		var up *url.URL
+		if c.relay {
+			up = upstream
+		}
+		r := httptest.NewRequest(c.method, "http://relay.example"+c.path, nil)
+		r.Header.Set("Accept", c.accept)
+		r.Header.Set("X-Forwarded-For", "203.0.113.7")
+		w := httptest.NewRecorder()
+		s.handler(up).ServeHTTP(w, r)
+		var got strings.Builder
+		w.Result().Header.Write(&got)
+		got.WriteString(w.Body.String())
+		if w.Code != c.code || !strings.Contains(got.String(), c.want) {
+			t.Errorf("%s %s (relay %v): %d %q, want %d containing %q", c.method, c.path, c.relay, w.Code, got.String(), c.code, c.want)
+		}
+		if proxied := strings.HasPrefix(w.Body.String(), "relay "); proxied && w.Header().Get("Content-Security-Policy") != "" {
+			t.Errorf("%s %s: the page's headers reached a relay response", c.method, c.path)
+		}
+	}
+}
+
+// A proxied websocket must outlive the server's read and write timeouts.
+func TestRelayWebsocketOutlivesTimeouts(t *testing.T) {
+	gotXFF := make(chan string, 1)
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotXFF <- r.Header.Get("X-Forwarded-For")
+		conn, brw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer conn.Close()
+		conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
+		io.Copy(conn, brw)
+	}))
+	defer relay.Close()
+	upstream, _ := url.Parse(relay.URL)
+	front := httptest.NewUnstartedServer((&server{}).handler(upstream))
+	front.Config.ReadTimeout = 100 * time.Millisecond
+	front.Config.WriteTimeout = 100 * time.Millisecond
+	front.Start()
+	defer front.Close()
+
+	conn, err := net.Dial("tcp", front.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	fmt.Fprint(conn, "GET / HTTP/1.1\r\nHost: relay.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nX-Forwarded-For: 203.0.113.7\r\n\r\n")
+	br := bufio.NewReader(conn)
+	res, err := http.ReadResponse(br, nil)
+	if err != nil || res.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("handshake: %v %v", res, err)
+	}
+	if xff := <-gotXFF; xff != "203.0.113.7" {
+		t.Errorf("relay saw X-Forwarded-For %q", xff)
+	}
+	time.Sleep(300 * time.Millisecond)
+	fmt.Fprint(conn, "ping\n")
+	if line, err := br.ReadString('\n'); line != "ping\n" {
+		t.Errorf("after the timeouts: %q, %v", line, err)
 	}
 }
