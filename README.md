@@ -2,12 +2,15 @@
 
 A public sign-up page that sells write access to a Nostr relay. A visitor enters a public key, pays a Lightning invoice (or a Bitcoin address, with BTCPay Server), and the key is recorded as a member until the period it paid for runs out.
 
-It is the sign-up service of the [strfry StartOS package](https://github.com/stupleb/strfry-startos), which carries this repo as a git submodule, runs the program, and turns its member list into strfry's write policy. The program itself never talks to the relay: it only writes `state.json`, so anything that reads that file can use it.
+It is the sign-up service of the [strfry StartOS package](https://github.com/stupleb/strfry-startos), which carries this repo as a git submodule, runs the program, and turns its member list into strfry's write policy. The program records members only in `state.json`, so anything that reads that file can use it.
+
+The page lives at `/join/`. Given the relay's own address in `SIGNUP_RELAY_UPSTREAM`, the program can also stand in front of the relay on one port, so the relay's `wss://` address opened in a browser shows the page: see [Routing](#routing).
 
 ## Contents
 
 - [How it works](#how-it-works)
 - [Configuration](#configuration)
+- [Routing](#routing)
 - [Public HTTP API](#public-http-api)
 - [Admin API](#admin-api)
 - [Files](#files)
@@ -34,6 +37,7 @@ Everything is set through environment variables.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `SIGNUP_LISTEN` | `:8080` | Address of the public listener. |
+| `SIGNUP_RELAY_UPSTREAM` | unset | The relay's own HTTP address, such as `http://127.0.0.1:7778`. Set, every request outside the page goes to it; unset, those get `404`. |
 | `SIGNUP_ADMIN_LISTEN` | `127.0.0.1:8081` | Address of the [admin API](#admin-api). It has no authentication: keep it on loopback. |
 | `SIGNUP_DATA` | `/var/lib/signup` | Directory holding `state.json`. |
 | `SIGNUP_BLOCKED_FILE` | unset | Path of `blocked.json`. Unset, no key is blocked. |
@@ -53,20 +57,31 @@ Everything is set through environment variables.
 
 Run it behind a reverse proxy that appends `X-Forwarded-For`: the rate limits take the last entry of that header as the client's address, and use the connection's address only when it is absent.
 
+## Routing
+
+| Request | Goes to |
+| --- | --- |
+| `/join/` and everything under it | The page, its script and style, and the [public API](#public-http-api). `/join` redirects to `/join/`. |
+| `GET` or `HEAD /` from a browser | A `302` to `/join/`, keeping the query string, so `?lang=` carries over. |
+| `GET /healthz` | The health check below. |
+| Anything else | The relay at `SIGNUP_RELAY_UPSTREAM`. |
+
+A request for `/` comes from a browser unless it asks for a websocket (an `Upgrade` header) or for the relay's NIP-11 document (`application/nostr+json` in `Accept`): Nostr clients use the relay's own URL for both. Requests to the relay keep their `Host` header and reach it with `X-Forwarded-For` exactly as it arrived, so a relay that reads the client's address from that header still sees the real one. Websockets are passed through for as long as they stay open, past the listener's read and write timeouts.
+
 ## Public HTTP API
 
 | Endpoint | Answer |
 | --- | --- |
-| `GET /` | The page, an HTML template filled with the relay's details and price. `app.js` and `app.css` are served beside it. |
-| `GET /api/member/{npub or hex}` | `{"pubkey", "npub", "member", "active", "until", "blocked"}`; `until` is Unix seconds or `null` for permanent access. |
-| `POST /api/invoice` `{"pubkey"}` | An invoice: `{"id", "status", "amountSats", "expiresAt", "bolt11", "lightningQr", "address", "onchainUri", "onchainQr", "onchainAvailable"}`, the QR codes as `data:` PNGs. `201` for a new invoice, `200` for an open one handed out again. |
-| `POST /api/invoice/{id}/onchain` | BTCPay only: activates the invoice's on-chain payment method and returns the invoice with its address. `409` when it can't be paid on-chain. |
-| `GET /api/invoice/{id}` | The invoice's status: `pending`, `processing` (BTCPay has seen an on-chain payment), `paid` (with `until`) or `expired`. |
+| `GET /join/` | The page, an HTML template filled with the relay's details and price. `app.js` and `app.css` are served beside it, and the script calls the API by relative paths. |
+| `GET /join/api/member/{npub or hex}` | `{"pubkey", "npub", "member", "active", "until", "blocked"}`; `until` is Unix seconds or `null` for permanent access. |
+| `POST /join/api/invoice` `{"pubkey"}` | An invoice: `{"id", "status", "amountSats", "expiresAt", "bolt11", "lightningQr", "address", "onchainUri", "onchainQr", "onchainAvailable"}`, the QR codes as `data:` PNGs. `201` for a new invoice, `200` for an open one handed out again. |
+| `POST /join/api/invoice/{id}/onchain` | BTCPay only: activates the invoice's on-chain payment method and returns the invoice with its address. `409` when it can't be paid on-chain. |
+| `GET /join/api/invoice/{id}` | The invoice's status: `pending`, `processing` (BTCPay has seen an on-chain payment), `paid` (with `until`) or `expired`. |
 | `GET /healthz` | Answered only to direct loopback requests with no `X-Forwarded-For`: `{"ok": true}` when the backend accepts the credentials, checked at most every 30 seconds, otherwise `503` with the backend's error. |
 
 Errors are `{"error": "<message>"}` in the visitor's language, with a status code that says what happened (`400`, `403` blocked, `404`, `409`, `429` rate-limited, `502` backend unreachable, `503` not taking payments).
 
-Every response carries a content security policy that allows only same-origin scripts, styles and requests, plus `https:` and `data:` images.
+Every response under `/join/` carries a content security policy that allows only same-origin scripts, styles and requests, plus `https:` and `data:` images. Responses from the relay pass through unchanged.
 
 ## Admin API
 

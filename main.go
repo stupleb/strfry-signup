@@ -15,6 +15,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -121,6 +123,14 @@ func main() {
 		log.Fatalf("unknown SIGNUP_BACKEND %q", kind)
 	}
 
+	var relay *url.URL
+	if u := os.Getenv("SIGNUP_RELAY_UPSTREAM"); u != "" {
+		var err error
+		if relay, err = url.Parse(u); err != nil || relay.Host == "" {
+			log.Fatalf("SIGNUP_RELAY_UPSTREAM must be a URL such as http://127.0.0.1:7778: %q", u)
+		}
+	}
+
 	var err error
 	if s.st, err = loadState(env("SIGNUP_DATA", "/var/lib/signup")); err != nil {
 		log.Fatalf("reading state: %v", err)
@@ -133,20 +143,9 @@ func main() {
 	defer stop()
 	go s.poll(ctx)
 
-	static, _ := fs.Sub(webFS, "web")
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", s.index)
-	mux.Handle("GET /app.js", http.FileServerFS(static))
-	mux.Handle("GET /app.css", http.FileServerFS(static))
-	mux.HandleFunc("GET /api/member/{pubkey}", s.memberStatus)
-	mux.HandleFunc("POST /api/invoice", s.createInvoice)
-	mux.HandleFunc("GET /api/invoice/{id}", s.invoiceStatus)
-	mux.HandleFunc("POST /api/invoice/{id}/onchain", s.onchain)
-	mux.HandleFunc("GET /healthz", s.healthz)
-
 	srv := &http.Server{
 		Addr:              env("SIGNUP_LISTEN", ":8080"),
-		Handler:           headers(mux),
+		Handler:           s.handler(relay),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      60 * time.Second,
@@ -174,6 +173,57 @@ func main() {
 	log.Printf("listening on %s", srv.Addr)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
+	}
+}
+
+// handler serves the page under /join/ and hands everything else, websockets included, to the relay.
+func (s *server) handler(relay *url.URL) http.Handler {
+	static, _ := fs.Sub(webFS, "web")
+	page := http.NewServeMux()
+	page.HandleFunc("GET /{$}", s.index)
+	page.Handle("GET /app.js", http.FileServerFS(static))
+	page.Handle("GET /app.css", http.FileServerFS(static))
+	page.HandleFunc("GET /api/member/{pubkey}", s.memberStatus)
+	page.HandleFunc("POST /api/invoice", s.createInvoice)
+	page.HandleFunc("GET /api/invoice/{id}", s.invoiceStatus)
+	page.HandleFunc("POST /api/invoice/{id}/onchain", s.onchain)
+
+	rest := http.NotFoundHandler()
+	if relay != nil {
+		rest = relayProxy(relay)
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/join/", headers(http.StripPrefix("/join", page)))
+	mux.HandleFunc("GET /healthz", s.healthz)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" && fromBrowser(r) {
+			to := "/join/"
+			if r.URL.RawQuery != "" {
+				to += "?" + r.URL.RawQuery
+			}
+			http.Redirect(w, r, to, http.StatusFound)
+			return
+		}
+		rest.ServeHTTP(w, r)
+	})
+	return mux
+}
+
+// fromBrowser tells a page view from a Nostr client asking the same URL for a websocket or NIP-11.
+func fromBrowser(r *http.Request) bool {
+	return (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
+		r.Header.Get("Upgrade") == "" &&
+		!strings.Contains(r.Header.Get("Accept"), "application/nostr+json")
+}
+
+func relayProxy(relay *url.URL) http.Handler {
+	return &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(relay)
+			pr.Out.Host = pr.In.Host
+			// the relay reads the client's address from this header, so it passes through unchanged
+			pr.Out.Header["X-Forwarded-For"] = pr.In.Header["X-Forwarded-For"]
+		},
 	}
 }
 
