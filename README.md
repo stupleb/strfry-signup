@@ -23,9 +23,9 @@ The page lives at `/join/`. Given the relay's own address in `SIGNUP_RELAY_UPSTR
 The page shows the relay's name, description, icon and price. When a visitor enters an npub or hex key (or takes one from a NIP-07 browser extension), it shows whether the key is a member, until when, or blocked, and offers to pay. Paying creates an invoice through the payment backend and shows it as a QR code, a wallet link and copyable text, then polls until it is paid or expires.
 
 - **Invoices** last 15 minutes. A key with an unpaid invoice that has more than two minutes left gets that invoice again instead of a new one.
-- **Polling**: a background poller asks the backend about each open invoice every 3 seconds, and every minute once it has expired or is waiting for on-chain confirmations. It gives up 10 minutes after expiry, 48 hours after creation for a `processing` invoice, and 24 hours after expiry while the backend keeps returning errors, so a backend outage never expires a paid invoice.
+- **Polling**: a background poller asks the backend about each open invoice every 3 seconds while a page is asking for its status, every 30 seconds otherwise, and every minute once it has expired or is waiting for on-chain confirmations. It gives up 10 minutes after expiry, 48 hours after creation for a `processing` invoice, and 24 hours after expiry while the backend keeps returning errors, so a backend outage never expires a paid invoice.
 - **Crediting**: a payment sets the key's `until` to the later of now and its current `until`, plus the period in force when the invoice was created. A period of 0 days sells permanent access, and permanent access stays permanent.
-- **Limits**: 10 invoice requests per client per 10 minutes, repeats for an open invoice included, with an IPv6 client counted by its /64; 100 unexpired unpaid invoices in all, counting those still being created. No invoice for a key that already has permanent access or is blocked.
+- **Limits**: per client, 10 invoice requests per 10 minutes, repeats for an open invoice included, and 3 unexpired unpaid invoices at once; 100 unexpired unpaid invoices in all, counting those still being created. A client is counted by its address, as set out under [Configuration](#configuration), a public IPv6 one by its /56, and addresses are kept in memory only. No invoice for a key that already has permanent access or is blocked.
 - **LNbits**: invoices come from `POST /api/v1/payments` with the wallet's invoice key; `paid` counts as paid and status `failed` as expired.
 - **BTCPay Server**: invoices are created in `SATS` with `checkout.expirationMinutes = 15`, and only their `BTC-LN` payment method is activated. `BTC-CHAIN` is activated, deriving a wallet address, only when the visitor opens the **On-chain** tab, so idle visitors don't push the wallet toward its gap limit; a store without Lightning gets `BTC-CHAIN` at once. `Settled` counts as paid, `Processing` as waiting for confirmations, `Expired` and `Invalid` as expired.
 - Requests to the backend never follow redirects, and the backend's error bodies are cut to 300 characters before they reach the log or `/healthz`.
@@ -37,6 +37,7 @@ Everything is set through environment variables.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `SIGNUP_LISTEN` | `:8080` | Address of the public listener. |
+| `SIGNUP_TRUSTED_PROXIES` | unset | Comma-separated IP addresses of reverse proxies whose `X-Forwarded-For` is believed. |
 | `SIGNUP_RELAY_UPSTREAM` | unset | The relay's own HTTP address, such as `http://127.0.0.1:7778`. Set, every request outside the page goes to it; unset, those get `404`. |
 | `SIGNUP_ADMIN_LISTEN` | `127.0.0.1:8081` | Address of the [admin API](#admin-api). It has no authentication: keep it on loopback. |
 | `SIGNUP_DATA` | `/var/lib/signup` | Directory holding `state.json`. |
@@ -55,7 +56,7 @@ Everything is set through environment variables.
 | `RELAY_ICON`, `RELAY_TERMS`, `RELAY_PRIVACY` | | Icon, terms and privacy links. Only `https://` URLs are used. |
 | `RELAY_CONTACT` | | Shown in the footer; a `mailto:` or `https://` URL, or a plain email address, becomes a link. |
 
-Run it behind a reverse proxy that appends `X-Forwarded-For`: the rate limits take the last entry of that header as the client's address, and use the connection's address only when it is absent.
+Behind a reverse proxy, list the proxy's address in `SIGNUP_TRUSTED_PROXIES`. A request from a listed address counts as coming from the last entry of its `X-Forwarded-For`, which the proxy must set or append; any other request counts as coming from the connection's own address, whatever its headers say.
 
 ## Routing
 
@@ -66,7 +67,7 @@ Run it behind a reverse proxy that appends `X-Forwarded-For`: the rate limits ta
 | `GET /healthz` | The health check below. |
 | Anything else | The relay at `SIGNUP_RELAY_UPSTREAM`. |
 
-A request for `/` comes from a browser unless it asks for a websocket (an `Upgrade` header) or for the relay's NIP-11 document (`application/nostr+json` in `Accept`): Nostr clients use the relay's own URL for both. Requests to the relay keep their `Host` header and reach it with `X-Forwarded-For` exactly as it arrived, so a relay that reads the client's address from that header still sees the real one. Websockets are passed through for as long as they stay open, past the listener's read and write timeouts.
+A request for `/` comes from a browser unless it asks for a websocket (an `Upgrade` header) or for the relay's NIP-11 document (`application/nostr+json` in `Accept`): Nostr clients use the relay's own URL for both. Requests to the relay keep their `Host` header and reach it with `X-Forwarded-For` set to the client's address as the limits count it, so a relay that reads the client's address from that header sees the same one. Websockets are passed through for as long as they stay open, past the listener's read and write timeouts.
 
 ## Public HTTP API
 
@@ -117,7 +118,7 @@ A second listener on `SIGNUP_ADMIN_LISTEN` takes the operator's changes. It spea
 }
 ```
 
-`until` is Unix seconds, or `null` for permanent access; `since` is when the key first became a member. An invoice keeps the price and period it was sold at, and once paid, the `until` it bought. Paid and expired invoices are dropped a day after they expire.
+`until` is Unix seconds, or `null` for permanent access; `since` is when the key first became a member. An invoice keeps the price and period it was sold at, and once paid, the `until` it bought. A paid invoice is dropped a day after its expiry time, an expired one an hour after.
 
 **`blocked.json`** at `SIGNUP_BLOCKED_FILE`, read-only here: a JSON object whose keys are blocked hex public keys, such as `{"<hex public key>": true}`. It is reread at most every 2 seconds. A blocked key can't pay, and the page tells it so.
 

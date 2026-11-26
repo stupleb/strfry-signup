@@ -16,9 +16,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,6 +37,7 @@ const (
 	maxPending      = 100
 	ipWindow        = 10 * time.Minute
 	invoicesPerIP   = 10
+	openPerIP       = 3
 	reuseMinimum    = 2 * time.Minute
 	processingLimit = 48 * time.Hour
 	// how long a payment keeps being checked while the backend errors
@@ -59,8 +62,9 @@ type server struct {
 	backend    backend
 	st         *state
 	blocked    blocklist
-	// invoices being created, counted toward maxPending; guarded by st.mu
-	reserved int
+	trusted    []netip.Addr
+	// invoices being created, by client, counted toward the limits; guarded by st.mu
+	creating map[string]int
 	pages    map[*locale]*template.Template
 
 	limitMu sync.Mutex
@@ -100,11 +104,22 @@ func main() {
 			Privacy:     httpsOnly(env("RELAY_PRIVACY", "")),
 			Contact:     env("RELAY_CONTACT", ""),
 		},
-		byIP:    map[string][]time.Time{},
-		blocked: blocklist{path: os.Getenv("SIGNUP_BLOCKED_FILE")},
+		byIP:     map[string][]time.Time{},
+		creating: map[string]int{},
+		blocked:  blocklist{path: os.Getenv("SIGNUP_BLOCKED_FILE")},
 	}
 	if s.priceSats < 1 || s.periodDays < 0 {
 		log.Fatal("SIGNUP_PRICE_SATS must be at least 1 and SIGNUP_PERIOD_DAYS at least 0")
+	}
+	for _, a := range strings.Split(os.Getenv("SIGNUP_TRUSTED_PROXIES"), ",") {
+		if a = strings.TrimSpace(a); a == "" {
+			continue
+		}
+		ip, err := netip.ParseAddr(a)
+		if err != nil {
+			log.Fatalf("SIGNUP_TRUSTED_PROXIES: %v", err)
+		}
+		s.trusted = append(s.trusted, ip.Unmap())
 	}
 	if ca := os.Getenv("SIGNUP_ROOT_CA"); ca != "" {
 		if err := trustRootCA(ca); err != nil {
@@ -190,7 +205,7 @@ func (s *server) handler(relay *url.URL) http.Handler {
 
 	rest := http.NotFoundHandler()
 	if relay != nil {
-		rest = relayProxy(relay)
+		rest = s.relayProxy(relay)
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/join/", headers(http.StripPrefix("/join", page)))
@@ -216,13 +231,13 @@ func fromBrowser(r *http.Request) bool {
 		!strings.Contains(r.Header.Get("Accept"), "application/nostr+json")
 }
 
-func relayProxy(relay *url.URL) http.Handler {
+func (s *server) relayProxy(relay *url.URL) http.Handler {
 	return &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(relay)
 			pr.Out.Host = pr.In.Host
-			// the relay reads the client's address from this header, so it passes through unchanged
-			pr.Out.Header["X-Forwarded-For"] = pr.In.Header["X-Forwarded-For"]
+			// the relay reads the client's address from this header
+			pr.Out.Header.Set("X-Forwarded-For", s.clientIP(pr.In))
 		},
 	}
 }
@@ -335,22 +350,23 @@ func (s *server) memberStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"pubkey": pk, "npub": encodeNpub(pk), "member": found, "active": active, "until": m.Until, "blocked": s.blocked.has(pk)})
 }
 
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		return strings.TrimSpace(parts[len(parts)-1])
-	}
+func (s *server) clientIP(r *http.Request) string {
 	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	return host
+	xff := r.Header.Values("X-Forwarded-For")
+	if peer, err := netip.ParseAddr(host); err != nil || len(xff) == 0 || !slices.Contains(s.trusted, peer.Unmap()) {
+		return host
+	}
+	parts := strings.Split(xff[len(xff)-1], ",")
+	return strings.TrimSpace(parts[len(parts)-1])
 }
 
-// rateKey groups an IPv6 client by its /64, the block one subscriber controls.
+// rateKey groups a public IPv6 address by its /56, the block ISPs commonly give one subscriber.
 func rateKey(ip string) string {
 	a := net.ParseIP(ip)
-	if a == nil || a.To4() != nil {
+	if a == nil || a.To4() != nil || a.IsPrivate() || a.IsLinkLocalUnicast() {
 		return ip
 	}
-	return a.Mask(net.CIDRMask(64, 128)).String()
+	return a.Mask(net.CIDRMask(56, 128)).String()
 }
 
 func (s *server) allow(ip string, now time.Time) bool {
@@ -442,7 +458,8 @@ func (s *server) createInvoice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
-	if !s.allow(rateKey(clientIP(r)), now) {
+	client := rateKey(s.clientIP(r))
+	if !s.allow(client, now) {
 		fail(w, http.StatusTooManyRequests, l.t("tooManyFromYou"))
 		return
 	}
@@ -453,7 +470,10 @@ func (s *server) createInvoice(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusConflict, l.t("permanent"))
 		return
 	}
-	pending := s.reserved
+	pending, mine := 0, s.creating[client]
+	for _, n := range s.creating {
+		pending += n
+	}
 	var reuseID string
 	var reuse invoice
 	for id, inv := range s.st.Invoices {
@@ -461,26 +481,37 @@ func (s *server) createInvoice(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		pending++
+		if inv.client == client {
+			mine++
+		}
 		if inv.Pubkey == pk && time.Unix(inv.ExpiresAt, 0).Sub(now) > reuseMinimum {
 			reuseID, reuse = id, *inv
 		}
 	}
-	full := reuseID == "" && pending >= maxPending
-	if reuseID == "" && !full {
-		s.reserved++
+	refusal := ""
+	switch {
+	case reuseID != "":
+	case mine >= openPerIP:
+		refusal = "tooManyFromYou"
+	case pending >= maxPending:
+		refusal = "tooManyWaiting"
+	default:
+		s.creating[client]++
 	}
 	s.st.mu.Unlock()
 	if reuseID != "" {
 		writeJSON(w, http.StatusOK, s.view(reuseID, &reuse, true))
 		return
 	}
-	if full {
-		fail(w, http.StatusTooManyRequests, l.t("tooManyWaiting"))
+	if refusal != "" {
+		fail(w, http.StatusTooManyRequests, l.t(refusal))
 		return
 	}
 	defer func() {
 		s.st.mu.Lock()
-		s.reserved--
+		if s.creating[client]--; s.creating[client] == 0 {
+			delete(s.creating, client)
+		}
 		s.st.mu.Unlock()
 	}()
 
@@ -503,7 +534,7 @@ func (s *server) createInvoice(w http.ResponseWriter, r *http.Request) {
 		Pubkey: pk, Bolt11: ni.bolt11, Address: ni.address, OnchainURI: ni.onchainURI,
 		Created: now.Unix(), ExpiresAt: ni.expiresAt, Status: statePending,
 		Sats: s.priceSats, PeriodDays: &period, OnchainAvailable: ni.onchain,
-		nextCheck: now,
+		client: client, nextCheck: now, pageSeen: now,
 	}
 	s.st.mu.Lock()
 	s.st.Invoices[ni.id] = inv
@@ -567,12 +598,17 @@ func (s *server) onchain(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) invoiceStatus(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	now := time.Now()
 	s.st.mu.Lock()
 	defer s.st.mu.Unlock()
 	inv, ok := s.st.Invoices[id]
 	if !ok {
 		fail(w, http.StatusNotFound, localeFor(r).t("unknownInvoice"))
 		return
+	}
+	inv.pageSeen = now
+	if next := now.Add(checkInterval(inv, now)); next.Before(inv.nextCheck) {
+		inv.nextCheck = next
 	}
 	writeJSON(w, http.StatusOK, s.view(id, inv, false))
 }
@@ -682,10 +718,13 @@ func (s *server) poll(ctx context.Context) {
 }
 
 func checkInterval(inv *invoice, now time.Time) time.Duration {
-	if inv.Status == stateProcessing || now.Unix() > inv.ExpiresAt {
+	switch {
+	case inv.Status == stateProcessing || now.Unix() > inv.ExpiresAt:
 		return time.Minute
+	case now.Sub(inv.pageSeen) < 10*time.Second:
+		return 3 * time.Second
 	}
-	return 3 * time.Second
+	return 30 * time.Second
 }
 
 func parsePubkey(s string) (string, bool) {
