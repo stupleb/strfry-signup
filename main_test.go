@@ -2,16 +2,19 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -143,14 +146,147 @@ func TestPubkeys(t *testing.T) {
 
 func TestRateKey(t *testing.T) {
 	for ip, want := range map[string]string{
-		"203.0.113.7":          "203.0.113.7",
-		"2001:db8:1:2:3:4:5:6": "2001:db8:1:2::",
-		"2001:db8:1:2:ffff::1": "2001:db8:1:2::",
-		"::ffff:203.0.113.7":   "::ffff:203.0.113.7",
+		"203.0.113.7":            "203.0.113.7",
+		"2001:db8:1:2ff:3:4:5:6": "2001:db8:1:200::",
+		"2001:db8:1:200::1":      "2001:db8:1:200::",
+		"2001:db8:1:300::1":      "2001:db8:1:300::",
+		"::ffff:203.0.113.7":     "::ffff:203.0.113.7",
+		"fe80::a:b:c:d":          "fe80::a:b:c:d",
+		"fd12:3456:789a:1::5":    "fd12:3456:789a:1::5",
 	} {
 		if got := rateKey(ip); got != want {
 			t.Errorf("rateKey(%s) = %s, want %s", ip, got, want)
 		}
+	}
+}
+
+func TestClientIP(t *testing.T) {
+	s := &server{trusted: []netip.Addr{netip.MustParseAddr("10.0.3.1")}}
+	for _, c := range []struct {
+		remote string
+		xff    []string
+		want   string
+	}{
+		{"10.0.3.1:5000", []string{"203.0.113.7"}, "203.0.113.7"},
+		{"10.0.3.1:5000", []string{"198.51.100.1, 203.0.113.7"}, "203.0.113.7"},
+		{"10.0.3.1:5000", []string{"198.51.100.1", "203.0.113.7"}, "203.0.113.7"},
+		{"[::ffff:10.0.3.1]:5000", []string{"2001:db8::1"}, "2001:db8::1"},
+		{"10.0.3.1:5000", nil, "10.0.3.1"},
+		{"10.0.3.2:5000", []string{"203.0.113.7"}, "10.0.3.2"},
+		{"[2001:db8::5]:5000", []string{"203.0.113.7"}, "2001:db8::5"},
+	} {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = c.remote
+		r.Header["X-Forwarded-For"] = c.xff
+		if got := s.clientIP(r); got != c.want {
+			t.Errorf("%s with X-Forwarded-For %q: %s, want %s", c.remote, c.xff, got, c.want)
+		}
+	}
+}
+
+type fakeBackend struct{ created atomic.Int64 }
+
+func (f *fakeBackend) create(context.Context, int64, string, string) (newInvoice, error) {
+	return newInvoice{id: fmt.Sprint("inv", f.created.Add(1)), bolt11: "lnbc1", expiresAt: time.Now().Add(invoiceLifetime).Unix()}, nil
+}
+func (*fakeBackend) status(context.Context, string) (payState, error) { return statePending, nil }
+func (*fakeBackend) check(context.Context) error                      { return nil }
+
+func TestOpenInvoicesPerClient(t *testing.T) {
+	st, err := loadState(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &server{
+		accepting: true, backend: &fakeBackend{}, priceSats: 21000, periodDays: 30, st: st,
+		trusted: []netip.Addr{netip.MustParseAddr("10.0.3.1")},
+		byIP:    map[string][]time.Time{}, creating: map[string]int{},
+	}
+	h := s.handler(nil)
+	key := func(n int) string { return fmt.Sprintf("%064x", n) }
+	ask := func(client string, n int) int {
+		r := httptest.NewRequest("POST", "/join/api/invoice", strings.NewReader(`{"pubkey":"`+key(n)+`"}`))
+		r.RemoteAddr = "10.0.3.1:5000"
+		r.Header.Set("X-Forwarded-For", client)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+	for n, client := range []string{"2001:db8:1:2ff::1", "2001:db8:1:200::2", "2001:db8:1:2aa::3"} {
+		if code := ask(client, n+1); code != http.StatusCreated {
+			t.Fatalf("invoice %d: %d", n+1, code)
+		}
+	}
+	for _, c := range []struct {
+		client string
+		key    int
+		want   int
+	}{
+		{"2001:db8:1:2bb::4", 4, http.StatusTooManyRequests},
+		{"2001:db8:1:2ff::1", 1, http.StatusOK},
+		{"2001:db8:1:300::1", 4, http.StatusCreated},
+	} {
+		if code := ask(c.client, c.key); code != c.want {
+			t.Errorf("key %d from %s: %d, want %d", c.key, c.client, code, c.want)
+		}
+	}
+	st.mu.Lock()
+	for _, inv := range st.Invoices {
+		if inv.Pubkey == key(2) {
+			inv.Status = statePaid
+		}
+	}
+	st.mu.Unlock()
+	if code := ask("2001:db8:1:2ff::1", 5); code != http.StatusCreated {
+		t.Errorf("once one is paid: %d", code)
+	}
+	if len(s.creating) != 0 {
+		t.Errorf("reservations left: %v", s.creating)
+	}
+}
+
+func TestCheckInterval(t *testing.T) {
+	now := time.Now()
+	open := now.Add(10 * time.Minute).Unix()
+	for _, c := range []struct {
+		inv  invoice
+		want time.Duration
+	}{
+		{invoice{Status: statePending, ExpiresAt: open, pageSeen: now.Add(-5 * time.Second)}, 3 * time.Second},
+		{invoice{Status: statePending, ExpiresAt: open, pageSeen: now.Add(-time.Minute)}, 30 * time.Second},
+		{invoice{Status: statePending, ExpiresAt: now.Unix() - 1, pageSeen: now}, time.Minute},
+		{invoice{Status: stateProcessing, ExpiresAt: open, pageSeen: now}, time.Minute},
+	} {
+		if got := checkInterval(&c.inv, now); got != c.want {
+			t.Errorf("%s invoice seen %v ago: %v, want %v", c.inv.Status, now.Sub(c.inv.pageSeen), got, c.want)
+		}
+	}
+
+	inv := &invoice{Status: statePending, ExpiresAt: open, nextCheck: now.Add(30 * time.Second)}
+	s := &server{st: &state{stateFile: stateFile{Invoices: map[string]*invoice{"x": inv}}}}
+	w := httptest.NewRecorder()
+	s.handler(nil).ServeHTTP(w, httptest.NewRequest("GET", "/join/api/invoice/x", nil))
+	if w.Code != http.StatusOK || inv.nextCheck.After(time.Now().Add(3*time.Second)) {
+		t.Errorf("after the page asked: %d, next check in %v", w.Code, time.Until(inv.nextCheck))
+	}
+}
+
+func TestPrune(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	ago := func(d time.Duration) int64 { return now.Add(-d).Unix() }
+	s := &state{stateFile: stateFile{Invoices: map[string]*invoice{
+		"paid":             {Status: statePaid, ExpiresAt: ago(2 * time.Hour)},
+		"paid long ago":    {Status: statePaid, ExpiresAt: ago(25 * time.Hour)},
+		"expired":          {Status: stateExpired, ExpiresAt: ago(50 * time.Minute)},
+		"expired long ago": {Status: stateExpired, ExpiresAt: ago(70 * time.Minute)},
+		"still checked":    {Status: statePending, ExpiresAt: ago(23 * time.Hour)},
+		"confirming":       {Status: stateProcessing, ExpiresAt: ago(30 * time.Hour)},
+	}}}
+	if !s.prune(now) {
+		t.Error("pruned nothing")
+	}
+	if got := slices.Sorted(maps.Keys(s.Invoices)); !slices.Equal(got, []string{"confirming", "expired", "paid", "still checked"}) {
+		t.Errorf("kept %v", got)
 	}
 }
 
@@ -192,7 +328,10 @@ func TestRouting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &server{accepting: true, backend: lnbits{}, priceSats: 21000, periodDays: 30, pages: pages, st: &state{stateFile: stateFile{Members: map[string]member{}}}}
+	s := &server{
+		accepting: true, backend: lnbits{}, priceSats: 21000, periodDays: 30, pages: pages, st: &state{stateFile: stateFile{Members: map[string]member{}}},
+		trusted: []netip.Addr{netip.MustParseAddr("192.0.2.1")},
+	}
 	upstream, _ := url.Parse(relay.URL)
 	const html, nip11 = "text/html,application/xhtml+xml", "application/nostr+json"
 	for _, c := range []struct {
@@ -233,6 +372,16 @@ func TestRouting(t *testing.T) {
 			t.Errorf("%s %s: the page's headers reached a relay response", c.method, c.path)
 		}
 	}
+
+	r := httptest.NewRequest("GET", "http://relay.example/", nil)
+	r.RemoteAddr = "198.51.100.9:1234"
+	r.Header.Set("Accept", nip11)
+	r.Header.Set("X-Forwarded-For", "203.0.113.7")
+	w := httptest.NewRecorder()
+	s.handler(upstream).ServeHTTP(w, r)
+	if !strings.HasSuffix(w.Body.String(), "xff=198.51.100.9") {
+		t.Errorf("from an untrusted address: %q", w.Body.String())
+	}
 }
 
 // A proxied websocket must outlive the server's read and write timeouts.
@@ -251,7 +400,7 @@ func TestRelayWebsocketOutlivesTimeouts(t *testing.T) {
 	}))
 	defer relay.Close()
 	upstream, _ := url.Parse(relay.URL)
-	front := httptest.NewUnstartedServer((&server{}).handler(upstream))
+	front := httptest.NewUnstartedServer((&server{trusted: []netip.Addr{netip.MustParseAddr("127.0.0.1")}}).handler(upstream))
 	front.Config.ReadTimeout = 100 * time.Millisecond
 	front.Config.WriteTimeout = 100 * time.Millisecond
 	front.Start()

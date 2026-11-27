@@ -31,7 +31,9 @@ type invoice struct {
 	// what the payment bought, once credited
 	Until *int64 `json:"until,omitempty"`
 
+	client    string
 	nextCheck time.Time
+	pageSeen  time.Time
 }
 
 // One file, so a payment and the membership it buys are written together.
@@ -128,8 +130,9 @@ func (s *state) credit(inv *invoice, periodDays int64, now time.Time) {
 func (s *state) prune(now time.Time) bool {
 	changed := false
 	for id, inv := range s.Invoices {
-		done := inv.Status == statePaid || inv.Status == stateExpired
-		if done && now.Unix() > inv.ExpiresAt+86400 {
+		paid := inv.Status == statePaid && now.Unix() > inv.ExpiresAt+86400
+		expired := inv.Status == stateExpired && now.Unix() > inv.ExpiresAt+3600
+		if paid || expired {
 			delete(s.Invoices, id)
 			changed = true
 		}
